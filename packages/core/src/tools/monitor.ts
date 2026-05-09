@@ -45,9 +45,14 @@ import { createDebugLogger } from '../utils/debugLogger.js';
 import { isSubpaths } from '../utils/paths.js';
 import {
   getMonitorOutputPath,
+  monitorCancel,
+  monitorComplete,
+  monitorEmitEvent,
+  monitorFail,
+  monitorRegister,
   type MonitorTaskRegistration,
-} from '../services/monitorRegistry.js';
-import { MAX_CONCURRENT_MONITORS } from '../services/monitorRegistry.js';
+} from '../agents/tasks/monitor-task.js';
+import { MAX_CONCURRENT_MONITORS } from '../agents/tasks/monitor-task.js';
 import {
   extractCommandRules,
   isShellCommandReadOnlyAST,
@@ -289,11 +294,13 @@ class MonitorToolInvocation extends BaseToolInvocation<
     );
 
     const monitorId = `mon_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
-    const registry = this.config.getMonitorRegistry();
+    const registry = this.config.getTaskRegistry();
     const ownerAgentId = getCurrentAgentId() ?? undefined;
 
     // Check concurrent monitor limit before spawning
-    const running = registry.getRunning();
+    const running = registry
+      .getByKind('monitor')
+      .filter((e) => e.status === 'running');
     if (running.length >= MAX_CONCURRENT_MONITORS) {
       return {
         llmContent: `Cannot start monitor: maximum concurrent monitors (${MAX_CONCURRENT_MONITORS}) reached. Stop an existing monitor first.`,
@@ -365,7 +372,7 @@ class MonitorToolInvocation extends BaseToolInvocation<
     // ----- Line buffering & throttling state ---------------------------------
     // Declared up-front (before `abortHandler`) so that the synchronous abort
     // path — either `entryAc.signal.aborted` already true at registration
-    // time, or `registry.register()` throwing — can flush via
+    // time, or `monitorRegister(registry, )` throwing — can flush via
     // `flushPartialLineBuffers` without hitting a TDZ ReferenceError.
     const stdoutBuf = { value: '' };
     const stderrBuf = { value: '' };
@@ -403,7 +410,7 @@ class MonitorToolInvocation extends BaseToolInvocation<
 
       if (tokenBucket > 0) {
         tokenBucket--;
-        registry.emitEvent(monitorId, sanitized);
+        monitorEmitEvent(registry, monitorId, sanitized);
       } else {
         registration.droppedLines++;
       }
@@ -476,7 +483,7 @@ class MonitorToolInvocation extends BaseToolInvocation<
     }
 
     try {
-      registry.register(registration);
+      monitorRegister(registry, registration);
     } catch (err) {
       abortHandler();
       entryAc.signal.removeEventListener('abort', abortHandler);
@@ -571,13 +578,13 @@ class MonitorToolInvocation extends BaseToolInvocation<
       if (registration.status !== 'running') return; // already settled
 
       if (entryAc.signal.aborted) {
-        registry.cancel(monitorId);
+        monitorCancel(registry, monitorId);
       } else if (code !== null && code !== 0) {
-        registry.fail(monitorId, `Exit code ${code}`);
+        monitorFail(registry, monitorId, `Exit code ${code}`);
       } else if (sig) {
-        registry.fail(monitorId, `Killed by signal ${sig}`);
+        monitorFail(registry, monitorId, `Killed by signal ${sig}`);
       } else {
-        registry.complete(monitorId, code);
+        monitorComplete(registry, monitorId, code);
       }
     };
 
@@ -598,7 +605,7 @@ class MonitorToolInvocation extends BaseToolInvocation<
       exited = true;
       cleanup();
       if (registration.status === 'running') {
-        registry.fail(monitorId, getErrorMessage(err));
+        monitorFail(registry, monitorId, getErrorMessage(err));
       }
     };
 

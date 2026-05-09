@@ -21,6 +21,7 @@ import {
   type ToolInvocation,
   type ToolResult,
 } from './tools.js';
+import { agentQueueMessage, getAgentTask } from '../agents/tasks/agent-task.js';
 
 export interface SendMessageParams {
   /** The ID of the background task to send the message to. */
@@ -45,8 +46,8 @@ class SendMessageInvocation extends BaseToolInvocation<
   }
 
   async execute(_signal: AbortSignal): Promise<ToolResult> {
-    const registry = this.config.getBackgroundTaskRegistry();
-    const entry = registry.get(this.params.task_id);
+    const registry = this.config.getTaskRegistry();
+    const entry = getAgentTask(registry, this.params.task_id);
 
     if (!entry) {
       return {
@@ -92,7 +93,7 @@ class SendMessageInvocation extends BaseToolInvocation<
       };
     }
 
-    registry.queueMessage(this.params.task_id, this.params.message);
+    agentQueueMessage(registry, this.params.task_id, this.params.message);
 
     return {
       llmContent: `Message queued for delivery to background task "${this.params.task_id}". The task will receive it at the next tool-round boundary.`,

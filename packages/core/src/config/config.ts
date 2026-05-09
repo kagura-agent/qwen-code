@@ -70,10 +70,26 @@ import { SkillManager } from '../skills/skill-manager.js';
 import { PermissionManager } from '../permissions/permission-manager.js';
 import { SubagentManager } from '../subagents/subagent-manager.js';
 import type { SubagentConfig } from '../subagents/types.js';
-import { BackgroundTaskRegistry } from '../agents/background-tasks.js';
-import { MonitorRegistry } from '../services/monitorRegistry.js';
+import { TaskRegistry } from '../agents/tasks/registry.js';
+import { registerTaskKind } from '../agents/tasks/dispatcher.js';
+import { AgentTaskKind, agentAbortAll } from '../agents/tasks/agent-task.js';
+import { ShellTaskKind, shellAbortAll } from '../agents/tasks/shell-task.js';
+import {
+  MonitorTaskKind,
+  monitorAbortAll,
+} from '../agents/tasks/monitor-task.js';
+import { DreamTaskKind } from '../agents/tasks/dream-task.js';
 import { BackgroundAgentResumeService } from '../agents/background-agent-resume.js';
-import { BackgroundShellRegistry } from '../services/backgroundShellRegistry.js';
+
+// Register every task kind with the dispatcher at module load. Mirrors
+// claw-code's `tasks.ts` pattern: a single place where each kind's
+// `Task` implementation is wired up. Idempotent — re-importing this
+// module (or constructing additional Config instances) does not
+// re-register.
+registerTaskKind(AgentTaskKind);
+registerTaskKind(ShellTaskKind);
+registerTaskKind(MonitorTaskKind);
+registerTaskKind(DreamTaskKind);
 import { FileReadCache } from '../services/fileReadCache.js';
 import { resolveStopHookBlockingCap } from '../hooks/stopHookCap.js';
 import {
@@ -685,10 +701,8 @@ export class Config {
   private toolRegistry!: ToolRegistry;
   private promptRegistry!: PromptRegistry;
   private subagentManager!: SubagentManager;
-  private readonly backgroundTaskRegistry = new BackgroundTaskRegistry();
-  private readonly monitorRegistry = new MonitorRegistry();
+  private readonly taskRegistry = new TaskRegistry();
   private backgroundAgentResumeService?: BackgroundAgentResumeService;
-  private readonly backgroundShellRegistry = new BackgroundShellRegistry();
   // Field initializer runs once on the parent Config; child Configs
   // built via Object.create(parent) intentionally do NOT pick this up
   // — see getFileReadCache() for the per-instance lazy initialization
@@ -2143,9 +2157,9 @@ export class Config {
         await this.toolRegistry.stop();
       }
 
-      this.backgroundTaskRegistry.abortAll();
-      this.monitorRegistry.abortAll({ notify: false });
-      this.backgroundShellRegistry.abortAll();
+      agentAbortAll(this.taskRegistry);
+      monitorAbortAll(this.taskRegistry, { notify: false });
+      shellAbortAll(this.taskRegistry);
 
       await this.cleanupArenaRuntime();
     } catch (error) {
@@ -3241,12 +3255,15 @@ export class Config {
     return this.subagentManager;
   }
 
-  getBackgroundTaskRegistry(): BackgroundTaskRegistry {
-    return this.backgroundTaskRegistry;
-  }
-
-  getMonitorRegistry(): MonitorRegistry {
-    return this.monitorRegistry;
+  /**
+   * Unified task registry covering agents, shells, and monitors. Dream
+   * consolidation tasks live in {@link MemoryManager} and are surfaced
+   * via the dream adapter (`tasks/dream-task.ts`); the dispatcher's
+   * `kill` table treats all four kinds uniformly even though the
+   * registry only holds three.
+   */
+  getTaskRegistry(): TaskRegistry {
+    return this.taskRegistry;
   }
 
   getBackgroundAgentResumeService(): BackgroundAgentResumeService {
@@ -3280,10 +3297,6 @@ export class Config {
     return this.getBackgroundAgentResumeService().abandonBackgroundAgent(
       agentId,
     );
-  }
-
-  getBackgroundShellRegistry(): BackgroundShellRegistry {
-    return this.backgroundShellRegistry;
   }
 
   /**

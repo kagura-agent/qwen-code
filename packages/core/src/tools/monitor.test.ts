@@ -124,7 +124,14 @@ vi.mock('../utils/shellAstParser.js', () => ({
 
 import { MonitorTool, sanitizeMonitorLine } from './monitor.js';
 import type { Config } from '../config/config.js';
-import { MonitorRegistry } from '../services/monitorRegistry.js';
+import { TaskRegistry } from '../agents/tasks/registry.js';
+import * as monitorTaskModule from '../agents/tasks/monitor-task.js';
+import {
+  getRunningMonitorTasks,
+  monitorAbortAll,
+  setMonitorNotificationCallback,
+  setMonitorRegisterCallback,
+} from '../agents/tasks/monitor-task.js';
 import type { ToolCallConfirmationDetails } from './tools.js';
 import { runWithAgentContext } from '../agents/runtime/agent-context.js';
 
@@ -172,14 +179,14 @@ function createMockChild(): ChildProcess & {
 describe('MonitorTool', () => {
   let monitorTool: MonitorTool;
   let mockConfig: Config;
-  let monitorRegistry: MonitorRegistry;
+  let monitorRegistry: TaskRegistry;
   let mockChild: ReturnType<typeof createMockChild>;
   let mockIsPathWithinWorkspace: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     vi.clearAllMocks();
 
-    monitorRegistry = new MonitorRegistry();
+    monitorRegistry = new TaskRegistry();
     mockIsPathWithinWorkspace = vi.fn().mockReturnValue(true);
     mockIsShellCommandReadOnlyAST.mockResolvedValue(false);
     mockExtractCommandRules.mockImplementation(async (command: string) => {
@@ -189,7 +196,7 @@ describe('MonitorTool', () => {
 
     mockConfig = {
       getTargetDir: vi.fn().mockReturnValue('/test/dir'),
-      getMonitorRegistry: vi.fn().mockReturnValue(monitorRegistry),
+      getTaskRegistry: vi.fn().mockReturnValue(monitorRegistry),
       getPermissionManager: vi.fn().mockReturnValue(undefined),
       getWorkspaceContext: vi.fn().mockReturnValue({
         isPathWithinWorkspace: mockIsPathWithinWorkspace,
@@ -210,7 +217,10 @@ describe('MonitorTool', () => {
   });
 
   afterEach(() => {
-    monitorRegistry.abortAll();
+    monitorAbortAll(monitorRegistry);
+    // Clear module-level callbacks so state doesn't leak across tests.
+    setMonitorNotificationCallback(undefined);
+    setMonitorRegisterCallback(undefined);
   });
 
   // Helper to access protected validateToolParamValues
@@ -662,7 +672,7 @@ describe('MonitorTool', () => {
           detached: true,
         }),
       );
-      expect(monitorRegistry.getRunning()[0]?.command).toBe(
+      expect(getRunningMonitorTasks(monitorRegistry)[0]?.command).toBe(
         'tail -f /var/log/app.log',
       );
     });
@@ -682,7 +692,7 @@ describe('MonitorTool', () => {
           detached: true,
         }),
       );
-      expect(monitorRegistry.getRunning()[0]?.command).toBe(
+      expect(getRunningMonitorTasks(monitorRegistry)[0]?.command).toBe(
         `/bin/bash -c 'tail -f /var/log/app.log'`,
       );
     });
@@ -702,7 +712,7 @@ describe('MonitorTool', () => {
           detached: true,
         }),
       );
-      expect(monitorRegistry.getRunning()[0]?.command).toBe(
+      expect(getRunningMonitorTasks(monitorRegistry)[0]?.command).toBe(
         `/bin/bash --noprofile -c 'tail -f /var/log/app.log'`,
       );
     });
@@ -722,7 +732,7 @@ describe('MonitorTool', () => {
           detached: true,
         }),
       );
-      expect(monitorRegistry.getRunning()[0]?.command).toBe(
+      expect(getRunningMonitorTasks(monitorRegistry)[0]?.command).toBe(
         `/bin/bash -c 'tail -f /var/log/app.log' ignored`,
       );
     });
@@ -734,7 +744,7 @@ describe('MonitorTool', () => {
 
       await invocation.execute(new AbortController().signal);
 
-      const running = monitorRegistry.getRunning();
+      const running = getRunningMonitorTasks(monitorRegistry);
       expect(running).toHaveLength(1);
       expect(running[0].command).toBe('tail -f log');
       expect(running[0].pid).toBe(12345);
@@ -750,7 +760,7 @@ describe('MonitorTool', () => {
         invocation.execute(new AbortController().signal),
       );
 
-      const running = monitorRegistry.getRunning();
+      const running = getRunningMonitorTasks(monitorRegistry);
       expect(running).toHaveLength(1);
       expect(running[0].ownerAgentId).toBe('agent-123');
     });
@@ -834,14 +844,12 @@ describe('MonitorTool', () => {
       const killSpy = vi
         .spyOn(process, 'kill')
         .mockImplementation(() => true as never);
+      const realMonitorRegister = monitorTaskModule.monitorRegister;
       const registerSpy = vi
-        .spyOn(monitorRegistry, 'register')
-        .mockImplementation((entry) => {
+        .spyOn(monitorTaskModule, 'monitorRegister')
+        .mockImplementation((reg, entry) => {
           entry.abortController.abort();
-          return MonitorRegistry.prototype.register.call(
-            monitorRegistry,
-            entry,
-          );
+          return realMonitorRegister(reg, entry);
         });
 
       try {
@@ -867,7 +875,7 @@ describe('MonitorTool', () => {
         command: 'tail -f log',
       });
       const registerCallback = vi.fn();
-      monitorRegistry.setRegisterCallback(registerCallback);
+      setMonitorRegisterCallback(registerCallback);
       mockSpawn.mockImplementation(() => {
         throw new Error('spawn failed');
       });
@@ -893,8 +901,8 @@ describe('MonitorTool', () => {
 
     it('replays spawn errors emitted before the late handler is attached', async () => {
       const callback = vi.fn();
-      monitorRegistry.setNotificationCallback(callback);
-      monitorRegistry.setRegisterCallback(() => {
+      setMonitorNotificationCallback(callback);
+      setMonitorRegisterCallback(() => {
         mockChild._emitError(new Error('spawn ENOENT'));
       });
       const invocation = createInvocation({
@@ -917,7 +925,7 @@ describe('MonitorTool', () => {
 
     it('emits events on stdout lines', async () => {
       const callback = vi.fn();
-      monitorRegistry.setNotificationCallback(callback);
+      setMonitorNotificationCallback(callback);
 
       const invocation = createInvocation({
         command: 'echo hello',
@@ -933,7 +941,7 @@ describe('MonitorTool', () => {
 
     it('buffers partial lines across chunks', async () => {
       const callback = vi.fn();
-      monitorRegistry.setNotificationCallback(callback);
+      setMonitorNotificationCallback(callback);
 
       const invocation = createInvocation({
         command: 'echo hello',
@@ -958,10 +966,10 @@ describe('MonitorTool', () => {
       await invocation.execute(new AbortController().signal);
       mockChild._emitExit(0);
 
-      expect(monitorRegistry.getRunning()).toHaveLength(1);
+      expect(getRunningMonitorTasks(monitorRegistry)).toHaveLength(1);
       mockChild._emitClose(0);
 
-      const entry = monitorRegistry.getRunning();
+      const entry = getRunningMonitorTasks(monitorRegistry);
       expect(entry).toHaveLength(0);
       const all = monitorRegistry.getAll();
       expect(all[0].status).toBe('completed');
@@ -969,7 +977,7 @@ describe('MonitorTool', () => {
 
     it('drains stdout emitted after exit before completing', async () => {
       const callback = vi.fn();
-      monitorRegistry.setNotificationCallback(callback);
+      setMonitorNotificationCallback(callback);
       const invocation = createInvocation({
         command: 'echo done',
       });
@@ -1026,7 +1034,7 @@ describe('MonitorTool', () => {
 
     it('settles as completed when exit and close both report null code and null signal', async () => {
       const callback = vi.fn();
-      monitorRegistry.setNotificationCallback(callback);
+      setMonitorNotificationCallback(callback);
 
       const invocation = createInvocation({
         command: 'some-cmd',
@@ -1060,13 +1068,13 @@ describe('MonitorTool', () => {
       turnAc.abort();
 
       // Monitor should still be running
-      const running = monitorRegistry.getRunning();
+      const running = getRunningMonitorTasks(monitorRegistry);
       expect(running).toHaveLength(1);
     });
 
     it('processes stderr data same as stdout', async () => {
       const callback = vi.fn();
-      monitorRegistry.setNotificationCallback(callback);
+      setMonitorNotificationCallback(callback);
 
       const invocation = createInvocation({
         command: 'some-cmd',
@@ -1081,7 +1089,7 @@ describe('MonitorTool', () => {
 
     it('filters out empty lines', async () => {
       const callback = vi.fn();
-      monitorRegistry.setNotificationCallback(callback);
+      setMonitorNotificationCallback(callback);
 
       const invocation = createInvocation({
         command: 'echo hello',
@@ -1097,7 +1105,7 @@ describe('MonitorTool', () => {
 
     it('uses separate buffers for stdout and stderr', async () => {
       const callback = vi.fn();
-      monitorRegistry.setNotificationCallback(callback);
+      setMonitorNotificationCallback(callback);
 
       const invocation = createInvocation({
         command: 'some-cmd',
@@ -1136,7 +1144,7 @@ describe('MonitorTool', () => {
 
     it('caps unbounded partial-line accumulation (no newlines)', async () => {
       const callback = vi.fn();
-      monitorRegistry.setNotificationCallback(callback);
+      setMonitorNotificationCallback(callback);
 
       const invocation = createInvocation({
         command: 'tight-loop --no-newlines',
@@ -1185,7 +1193,7 @@ describe('MonitorTool', () => {
       try {
         vi.setSystemTime(0);
         const callback = vi.fn();
-        monitorRegistry.setNotificationCallback(callback);
+        setMonitorNotificationCallback(callback);
 
         const invocation = createInvocation({ command: 'noisy-cmd' });
         await invocation.execute(new AbortController().signal);
@@ -1199,7 +1207,7 @@ describe('MonitorTool', () => {
         // Burst is 5; lines 6 and 7 must be dropped.
         expect(callback).toHaveBeenCalledTimes(5);
       } finally {
-        monitorRegistry.abortAll({ notify: false });
+        monitorAbortAll(monitorRegistry, { notify: false });
         vi.useRealTimers();
       }
     });
@@ -1209,7 +1217,7 @@ describe('MonitorTool', () => {
       try {
         vi.setSystemTime(0);
         const callback = vi.fn();
-        monitorRegistry.setNotificationCallback(callback);
+        setMonitorNotificationCallback(callback);
 
         const invocation = createInvocation({ command: 'noisy-cmd' });
         await invocation.execute(new AbortController().signal);
@@ -1236,7 +1244,7 @@ describe('MonitorTool', () => {
         mockChild.stdout.emit('data', Buffer.from('l9\n'));
         expect(callback).toHaveBeenCalledTimes(7);
       } finally {
-        monitorRegistry.abortAll({ notify: false });
+        monitorAbortAll(monitorRegistry, { notify: false });
         vi.useRealTimers();
       }
     });
@@ -1246,7 +1254,7 @@ describe('MonitorTool', () => {
       try {
         vi.setSystemTime(0);
         const callback = vi.fn();
-        monitorRegistry.setNotificationCallback(callback);
+        setMonitorNotificationCallback(callback);
 
         const invocation = createInvocation({ command: 'noisy-cmd' });
         await invocation.execute(new AbortController().signal);
@@ -1264,7 +1272,7 @@ describe('MonitorTool', () => {
         // long idle gap.
         expect(callback).toHaveBeenCalledTimes(10);
       } finally {
-        monitorRegistry.abortAll({ notify: false });
+        monitorAbortAll(monitorRegistry, { notify: false });
         vi.useRealTimers();
       }
     });
@@ -1274,7 +1282,7 @@ describe('MonitorTool', () => {
       try {
         vi.setSystemTime(0);
         const callback = vi.fn();
-        monitorRegistry.setNotificationCallback(callback);
+        setMonitorNotificationCallback(callback);
 
         const invocation = createInvocation({ command: 'noisy-cmd' });
         await invocation.execute(new AbortController().signal);
@@ -1288,7 +1296,7 @@ describe('MonitorTool', () => {
 
         expect(callback).toHaveBeenCalledTimes(5);
       } finally {
-        monitorRegistry.abortAll({ notify: false });
+        monitorAbortAll(monitorRegistry, { notify: false });
         vi.useRealTimers();
       }
     });
@@ -1300,7 +1308,7 @@ describe('MonitorTool', () => {
       try {
         mockTime = 0;
         const callback = vi.fn();
-        monitorRegistry.setNotificationCallback(callback);
+        setMonitorNotificationCallback(callback);
 
         const invocation = createInvocation({ command: 'noisy-cmd' });
         await invocation.execute(new AbortController().signal);
@@ -1339,7 +1347,7 @@ describe('MonitorTool', () => {
         // and l12b would be dropped (callback still 10).
       } finally {
         Date.now = realDateNow;
-        monitorRegistry.abortAll({ notify: false });
+        monitorAbortAll(monitorRegistry, { notify: false });
       }
     });
   });
