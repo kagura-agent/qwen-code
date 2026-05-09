@@ -13,7 +13,7 @@
  * working for one release.
  *
  * Removal: scheduled for the release after PR 2 lands. New code should
- * import from `'./tasks/agent-task.js'` directly.
+ * import from `'../tasks/agent-task.js'` directly.
  */
 
 export {
@@ -27,4 +27,4 @@ export {
   type BackgroundTaskStatus,
   type NotificationMeta,
   buildBackgroundEntryLabel,
-} from './tasks/agent-task.js';
+} from '../tasks/agent-task.js';
