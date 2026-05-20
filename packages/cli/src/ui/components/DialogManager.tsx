@@ -45,7 +45,7 @@ import { AgentsManagerDialog } from './subagents/manage/AgentsManagerDialog.js';
 import { ExtensionsManagerDialog } from './extensions/ExtensionsManagerDialog.js';
 import { MCPManagementDialog } from './mcp/MCPManagementDialog.js';
 import { HooksManagementDialog } from './hooks/HooksManagementDialog.js';
-import { SelfImproveSourceDialog } from './SelfImproveSourceDialog.js';
+import { AutoImproveSourceDialog } from './AutoImproveSourceDialog.js';
 import { SessionPicker } from './SessionPicker.js';
 import { RewindSelector } from './RewindSelector.js';
 import { MemoryDialog } from './MemoryDialog.js';
@@ -380,12 +380,12 @@ export const DialogManager = ({
       <TrustDialog onExit={uiActions.closeTrustDialog} addItem={addItem} />
     );
   }
-  if (uiState.isSelfImproveSourceDialogOpen) {
+  if (uiState.isAutoImproveSourceDialogOpen) {
     return (
-      <SelfImproveSourceDialog
+      <AutoImproveSourceDialog
         config={config}
         addItem={addItem}
-        onClose={uiActions.closeSelfImproveSourceDialog}
+        onClose={uiActions.closeAutoImproveSourceDialog}
       />
     );
   }

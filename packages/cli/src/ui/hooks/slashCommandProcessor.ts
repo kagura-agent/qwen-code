@@ -109,7 +109,7 @@ export interface SlashCommandProcessorActions {
   openExtensionsManagerDialog: () => void;
   openMcpDialog: () => void;
   openHooksDialog: () => void;
-  openSelfImproveSourceDialog: () => void;
+  openAutoImproveSourceDialog: () => void;
   openRewindSelector: () => void;
   openHelpDialog: () => void;
 }
@@ -714,8 +714,8 @@ export const useSlashCommandProcessor = (
                     case 'hooks':
                       actions.openHooksDialog();
                       return { type: 'handled' };
-                    case 'self-improve-source':
-                      actions.openSelfImproveSourceDialog();
+                    case 'auto-improve-source':
+                      actions.openAutoImproveSourceDialog();
                       return { type: 'handled' };
                     case 'approval-mode':
                       actions.openApprovalModeDialog();
