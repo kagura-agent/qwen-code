@@ -85,8 +85,20 @@ import { useSessionStats } from '../contexts/SessionContext.js';
 import type { LoadedSettings } from '../../config/settings.js';
 import { t } from '../../i18n/index.js';
 import { useDualOutput } from '../../dualOutput/DualOutputContext.js';
+import { markActiveAutoImproveRunCancelled } from '../commands/autoImproveState.js';
 
 const debugLogger = createDebugLogger('GEMINI_STREAM');
+
+function parseAutoImproveTickLoopId(
+  submitType: SendMessageType,
+  query: PartListUnion,
+): string | null {
+  if (submitType !== SendMessageType.Cron || typeof query !== 'string') {
+    return null;
+  }
+  const match = query.trim().match(/^\/auto-improve\s+tick\s+(\S+)$/);
+  return match?.[1] ?? null;
+}
 
 /**
  * Pull the assistant's most recent visible text from the UI history. Used as
@@ -332,6 +344,7 @@ export const useGeminiStream = (
   // alongside lastTurnUserItemRef.
   const turnSawContentEventRef = useRef(false);
   const lastPromptErroredRef = useRef(false);
+  const currentAutoImproveLoopIdRef = useRef<string | null>(null);
   const dualOutput = useDualOutput();
   const [isResponding, setIsResponding] = useState<boolean>(false);
   const [thought, setThought] = useState<ThoughtSummary | null>(null);
@@ -662,6 +675,26 @@ export const useGeminiStream = (
       },
       Date.now(),
     );
+    const autoImproveLoopId = currentAutoImproveLoopIdRef.current;
+    if (autoImproveLoopId) {
+      currentAutoImproveLoopIdRef.current = null;
+      const cwd = config.getWorkingDir() || config.getProjectRoot();
+      void markActiveAutoImproveRunCancelled(cwd, autoImproveLoopId).catch(
+        (error: unknown) => {
+          debugLogger.warn(
+            'Failed to mark auto-improve run cancelled:',
+            error instanceof Error ? error.message : String(error),
+          );
+        },
+      );
+      addItem(
+        {
+          type: MessageType.INFO,
+          text: 'Auto-improve run cancelled. The loop is still active; run /auto-improve stop to stop future ticks.',
+        },
+        Date.now(),
+      );
+    }
     setPendingHistoryItem(null);
     clearRetryCountdown();
     // Wrap the consumer callback so a throw in AppContainer's cancel
@@ -1628,6 +1661,10 @@ export const useGeminiStream = (
       ) {
         lastTurnUserItemRef.current = null;
         turnSawContentEventRef.current = false;
+        currentAutoImproveLoopIdRef.current = parseAutoImproveTickLoopId(
+          submitType,
+          query,
+        );
       }
 
       const userMessageTimestamp = Date.now();
