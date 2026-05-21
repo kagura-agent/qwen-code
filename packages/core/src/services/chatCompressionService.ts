@@ -13,12 +13,7 @@ import { getCompressionPrompt } from '../core/prompts.js';
 import { runSideQuery } from '../utils/sideQuery.js';
 import { logChatCompression } from '../telemetry/loggers.js';
 import { makeChatCompressionEvent } from '../telemetry/types.js';
-import type { PermissionMode } from '../hooks/types.js';
-import {
-  SessionStartSource,
-  PreCompactTrigger,
-  PostCompactTrigger,
-} from '../hooks/types.js';
+import { PreCompactTrigger, PostCompactTrigger } from '../hooks/types.js';
 import {
   DEFAULT_IMAGE_TOKEN_ESTIMATE,
   estimateContentChars,
@@ -217,7 +212,6 @@ export class ChatCompressionService {
       COMPRESSION_TOKEN_THRESHOLD;
     const slimmingConfig = resolveSlimmingConfig(chatCompressionSettings);
 
-    // Cheap gates first — these don't need the curated history.
     if (threshold <= 0 || (hasFailedCompressionAttempt && !force)) {
       return {
         newHistory: null,
@@ -229,9 +223,6 @@ export class ChatCompressionService {
       };
     }
 
-    // Don't compress if not forced and we are under the limit. This is the
-    // steady-state path on every send; we want to exit before paying for the
-    // full `getHistory(true)` clone below.
     if (!force) {
       const contextLimit =
         config.getContentGeneratorConfig()?.contextWindowSize ??
@@ -248,7 +239,12 @@ export class ChatCompressionService {
       }
     }
 
-    const curatedHistory = chat.getHistory(true);
+    // Compression only reads the existing history while deciding the split and
+    // preparing the side-query payload. Avoid `getHistory(true)` here: long
+    // tool-heavy sessions can make a defensive deep clone larger than the
+    // remaining V8 heap headroom at exactly the moment compaction is trying to
+    // reduce memory pressure.
+    const curatedHistory = chat.getHistoryShallow(true);
     if (curatedHistory.length === 0) {
       return {
         newHistory: null,
@@ -491,24 +487,6 @@ export class ChatCompressionService {
         },
       };
     } else {
-      // Fire SessionStart event after successful compression
-      try {
-        const permissionMode = String(
-          config.getApprovalMode(),
-        ) as PermissionMode;
-        await config
-          .getHookSystem()
-          ?.fireSessionStartEvent(
-            SessionStartSource.Compact,
-            model ?? '',
-            permissionMode,
-            undefined,
-            signal,
-          );
-      } catch (err) {
-        config.getDebugLogger().warn(`SessionStart hook failed: ${err}`);
-      }
-
       // Fire PostCompact event after successful compression
       try {
         const postCompactTrigger =

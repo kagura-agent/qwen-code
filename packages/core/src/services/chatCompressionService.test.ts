@@ -17,11 +17,7 @@ import { tokenLimit } from '../core/tokenLimits.js';
 import type { GeminiChat } from '../core/geminiChat.js';
 import type { Config } from '../config/config.js';
 import type { BaseLlmClient } from '../core/baseLlmClient.js';
-import {
-  SessionStartSource,
-  PreCompactTrigger,
-  PostCompactTrigger,
-} from '../hooks/types.js';
+import { PreCompactTrigger, PostCompactTrigger } from '../hooks/types.js';
 
 vi.mock('../telemetry/uiTelemetry.js');
 vi.mock('../core/tokenLimits.js');
@@ -387,18 +383,18 @@ describe('ChatCompressionService', () => {
   let mockConfig: Config;
   const mockModel = 'gemini-pro';
   const mockPromptId = 'test-prompt-id';
-  let mockFireSessionStartEvent: ReturnType<typeof vi.fn>;
   let mockGetHookSystem: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     service = new ChatCompressionService();
     mockChat = {
       getHistory: vi.fn(),
+      getHistoryShallow: vi.fn((curated?: boolean) =>
+        mockChat.getHistory(curated),
+      ),
+      appendSystemInstruction: vi.fn(),
     } as unknown as GeminiChat;
-    mockFireSessionStartEvent = vi.fn().mockResolvedValue(undefined);
-    mockGetHookSystem = vi.fn().mockReturnValue({
-      fireSessionStartEvent: mockFireSessionStartEvent,
-    });
+    mockGetHookSystem = vi.fn().mockReturnValue({});
     mockConfig = {
       getChatCompression: vi.fn(),
       getBaseLlmClient: vi.fn(),
@@ -603,13 +599,72 @@ describe('ChatCompressionService', () => {
     expect(result.newHistory![0].parts![0].text).toBe('Summary');
     expect(mockGenerateContent).toHaveBeenCalled();
     expect(mockGetHookSystem).toHaveBeenCalled();
-    expect(mockFireSessionStartEvent).toHaveBeenCalledWith(
-      SessionStartSource.Compact,
-      mockModel,
-      'default',
-      undefined,
-      undefined,
-    );
+  });
+
+  it('does not deep-clone full history while compressing', async () => {
+    const largeToolOutput = 'x'.repeat(1024 * 1024);
+    const history: Content[] = [
+      { role: 'user', parts: [{ text: 'review this PR' }] },
+      {
+        role: 'model',
+        parts: [
+          {
+            functionCall: {
+              id: 'read-1',
+              name: 'read_file',
+              args: { path: 'large.ts' },
+            },
+          },
+        ],
+      },
+      {
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              id: 'read-1',
+              name: 'read_file',
+              response: { output: largeToolOutput },
+            },
+          },
+        ],
+      },
+      { role: 'model', parts: [{ text: 'analysis' }] },
+    ];
+    vi.mocked(mockChat.getHistory).mockImplementation(() => {
+      throw new Error('getHistory should not be called by compression');
+    });
+    vi.mocked(mockChat.getHistoryShallow).mockReturnValue(history);
+    vi.mocked(mockConfig.getContentGeneratorConfig).mockReturnValue({
+      model: 'gemini-pro',
+      contextWindowSize: 1000,
+    } as unknown as ReturnType<typeof mockConfig.getContentGeneratorConfig>);
+    vi.mocked(uiTelemetryService.getLastPromptTokenCount).mockReturnValue(800);
+
+    const mockGenerateContent = vi.fn().mockResolvedValue({
+      text: 'Summary',
+      usage: {
+        promptTokenCount: 1600,
+        candidatesTokenCount: 50,
+        totalTokenCount: 1650,
+      },
+    });
+    vi.mocked(mockConfig.getBaseLlmClient).mockReturnValue({
+      generateText: mockGenerateContent,
+    } as unknown as BaseLlmClient);
+
+    const result = await service.compress(mockChat, {
+      promptId: mockPromptId,
+      force: false,
+      model: mockModel,
+      config: mockConfig,
+      hasFailedCompressionAttempt: false,
+      originalTokenCount: uiTelemetryService.getLastPromptTokenCount(),
+    });
+
+    expect(result.info.compressionStatus).toBe(CompressionStatus.COMPRESSED);
+    expect(mockChat.getHistory).not.toHaveBeenCalled();
+    expect(mockChat.getHistoryShallow).toHaveBeenCalledWith(true);
   });
 
   it('should force compress even if under threshold', async () => {
@@ -648,13 +703,41 @@ describe('ChatCompressionService', () => {
 
     expect(result.info.compressionStatus).toBe(CompressionStatus.COMPRESSED);
     expect(result.newHistory).not.toBeNull();
-    expect(mockFireSessionStartEvent).toHaveBeenCalledWith(
-      SessionStartSource.Compact,
-      mockModel,
-      'default',
-      undefined,
-      undefined,
-    );
+  });
+
+  it('does not append SessionStart additionalContext after successful compression', async () => {
+    const history: Content[] = [
+      { role: 'user', parts: [{ text: 'msg1' }] },
+      { role: 'model', parts: [{ text: 'msg2' }] },
+      { role: 'user', parts: [{ text: 'msg3' }] },
+      { role: 'model', parts: [{ text: 'msg4' }] },
+    ];
+    vi.mocked(mockChat.getHistory).mockReturnValue(history);
+    vi.mocked(uiTelemetryService.getLastPromptTokenCount).mockReturnValue(100);
+    vi.mocked(tokenLimit).mockReturnValue(1000);
+
+    const mockGenerateContent = vi.fn().mockResolvedValue({
+      text: 'Summary',
+      usage: {
+        promptTokenCount: 1100,
+        candidatesTokenCount: 50,
+        totalTokenCount: 1150,
+      },
+    });
+    vi.mocked(mockConfig.getBaseLlmClient).mockReturnValue({
+      generateText: mockGenerateContent,
+    } as unknown as BaseLlmClient);
+
+    await service.compress(mockChat, {
+      promptId: mockPromptId,
+      force: true,
+      model: mockModel,
+      config: mockConfig,
+      hasFailedCompressionAttempt: false,
+      originalTokenCount: uiTelemetryService.getLastPromptTokenCount(),
+    });
+
+    expect(mockGenerateContent).toHaveBeenCalled();
   });
 
   it('passes abort signal to summary generation', async () => {
@@ -937,7 +1020,7 @@ describe('ChatCompressionService', () => {
     expect(result.newHistory).toBeNull();
   });
 
-  it('should not fire SessionStart event when compression fails', async () => {
+  it('should not append extra SessionStart context when compression fails', async () => {
     const history: Content[] = [
       { role: 'user', parts: [{ text: 'msg1' }] },
       { role: 'model', parts: [{ text: 'msg2' }] },
@@ -971,10 +1054,9 @@ describe('ChatCompressionService', () => {
       CompressionStatus.COMPRESSION_FAILED_INFLATED_TOKEN_COUNT,
     );
     expect(result.newHistory).toBeNull();
-    expect(mockFireSessionStartEvent).not.toHaveBeenCalled();
   });
 
-  it('should handle SessionStart hook errors gracefully', async () => {
+  it('should complete compression without SessionStart hooks', async () => {
     const history: Content[] = [
       { role: 'user', parts: [{ text: 'msg1' }] },
       { role: 'model', parts: [{ text: 'msg2' }] },
@@ -987,10 +1069,6 @@ describe('ChatCompressionService', () => {
       model: 'gemini-pro',
       contextWindowSize: 1000,
     } as unknown as ReturnType<typeof mockConfig.getContentGeneratorConfig>);
-
-    mockFireSessionStartEvent.mockRejectedValue(
-      new Error('SessionStart hook failed'),
-    );
 
     const mockGenerateContent = vi.fn().mockResolvedValue({
       text: 'Summary',
@@ -1026,7 +1104,6 @@ describe('ChatCompressionService', () => {
       mockFirePreCompactEvent = vi.fn().mockResolvedValue(undefined);
       mockFirePostCompactEvent = vi.fn().mockResolvedValue(undefined);
       mockGetHookSystem.mockReturnValue({
-        fireSessionStartEvent: mockFireSessionStartEvent,
         firePreCompactEvent: mockFirePreCompactEvent,
         firePostCompactEvent: mockFirePostCompactEvent,
       });
@@ -1229,7 +1306,7 @@ describe('ChatCompressionService', () => {
       expect(mockFirePreCompactEvent).toHaveBeenCalled();
     });
 
-    it('should fire PreCompact hook before compression and SessionStart after', async () => {
+    it('should fire PreCompact hook before compression', async () => {
       const history: Content[] = [
         { role: 'user', parts: [{ text: 'msg1' }] },
         { role: 'model', parts: [{ text: 'msg2' }] },
@@ -1248,9 +1325,6 @@ describe('ChatCompressionService', () => {
       const callOrder: string[] = [];
       mockFirePreCompactEvent.mockImplementation(async () => {
         callOrder.push('PreCompact');
-      });
-      mockFireSessionStartEvent.mockImplementation(async () => {
-        callOrder.push('SessionStart');
       });
 
       const mockGenerateContent = vi.fn().mockResolvedValue({
@@ -1274,8 +1348,7 @@ describe('ChatCompressionService', () => {
         originalTokenCount: uiTelemetryService.getLastPromptTokenCount(),
       });
 
-      // PreCompact should be called before SessionStart
-      expect(callOrder).toEqual(['PreCompact', 'SessionStart']);
+      expect(callOrder).toEqual(['PreCompact']);
     });
 
     it('should not fire PreCompact hook when hookSystem is null', async () => {
@@ -1333,7 +1406,6 @@ describe('ChatCompressionService', () => {
       mockFirePreCompactEvent = vi.fn().mockResolvedValue(undefined);
       mockFirePostCompactEvent = vi.fn().mockResolvedValue(undefined);
       mockGetHookSystem.mockReturnValue({
-        fireSessionStartEvent: mockFireSessionStartEvent,
         firePreCompactEvent: mockFirePreCompactEvent,
         firePostCompactEvent: mockFirePostCompactEvent,
       });
@@ -1513,7 +1585,7 @@ describe('ChatCompressionService', () => {
       expect(mockFirePostCompactEvent).toHaveBeenCalled();
     });
 
-    it('should fire hooks in correct order: PreCompact -> SessionStart -> PostCompact', async () => {
+    it('should fire hooks in correct order: PreCompact -> PostCompact', async () => {
       const history: Content[] = [
         { role: 'user', parts: [{ text: 'msg1' }] },
         { role: 'model', parts: [{ text: 'msg2' }] },
@@ -1532,9 +1604,6 @@ describe('ChatCompressionService', () => {
       const callOrder: string[] = [];
       mockFirePreCompactEvent.mockImplementation(async () => {
         callOrder.push('PreCompact');
-      });
-      mockFireSessionStartEvent.mockImplementation(async () => {
-        callOrder.push('SessionStart');
       });
       mockFirePostCompactEvent.mockImplementation(async () => {
         callOrder.push('PostCompact');
@@ -1561,8 +1630,8 @@ describe('ChatCompressionService', () => {
         originalTokenCount: uiTelemetryService.getLastPromptTokenCount(),
       });
 
-      // Hooks should be called in order: PreCompact -> SessionStart -> PostCompact
-      expect(callOrder).toEqual(['PreCompact', 'SessionStart', 'PostCompact']);
+      // Hooks should be called in order: PreCompact -> PostCompact
+      expect(callOrder).toEqual(['PreCompact', 'PostCompact']);
     });
 
     it('should not fire PostCompact hook when hookSystem is null', async () => {

@@ -53,6 +53,8 @@ import {
 import type { UiTelemetryService } from '../telemetry/uiTelemetry.js';
 import { type ChatCompressionInfo, CompressionStatus } from './turn.js';
 import { getContextLengthExceededInfo } from '../utils/contextLengthError.js';
+import type { SessionStartSource } from '../hooks/types.js';
+import { getCustomSystemPrompt } from './prompts.js';
 
 const debugLogger = createDebugLogger('QWEN_CODE_CHAT');
 
@@ -346,6 +348,13 @@ function extractCuratedHistory(comprehensiveHistory: Content[]): Content[] {
   return curatedHistory;
 }
 
+function copyContentContainer(content: Content): Content {
+  return {
+    ...content,
+    ...(content.parts ? { parts: [...content.parts] } : {}),
+  };
+}
+
 function stripThoughtPartsFromContent(content: Content): Content | null {
   if (!content.parts) {
     return content;
@@ -383,6 +392,36 @@ export class InvalidStreamError extends Error {
  * @remarks
  * The session maintains all the turns between user and model.
  */
+const SESSION_START_CONTEXT_SENTINEL_START =
+  '<qwen:session-start-context hidden="true">';
+const SESSION_START_CONTEXT_SENTINEL_END = '</qwen:session-start-context>';
+const SESSION_START_CONTEXT_HEADER = 'SessionStart additional context';
+
+function buildSessionStartContextBlock(extraInstruction: string): string {
+  return `\n\n${SESSION_START_CONTEXT_SENTINEL_START}\n${SESSION_START_CONTEXT_HEADER}:\n${extraInstruction}\n${SESSION_START_CONTEXT_SENTINEL_END}`;
+}
+
+function stripTrailingSessionStartContextBlock(
+  systemInstruction: string,
+): string {
+  const startIndex = systemInstruction.lastIndexOf(
+    `\n\n${SESSION_START_CONTEXT_SENTINEL_START}\n${SESSION_START_CONTEXT_HEADER}:\n`,
+  );
+  if (startIndex === -1) {
+    return systemInstruction;
+  }
+
+  const endIndex = systemInstruction.indexOf(
+    `\n${SESSION_START_CONTEXT_SENTINEL_END}`,
+    startIndex,
+  );
+  if (endIndex === -1) {
+    return systemInstruction;
+  }
+
+  return systemInstruction.slice(0, startIndex);
+}
+
 export class GeminiChat {
   // A promise to represent the current state of the message being sent to the
   // model.
@@ -438,6 +477,18 @@ export class GeminiChat {
   }
 
   /**
+   * Builds request contents for the content generator without deep-cloning the
+   * whole chat history. This is an internal hot path: long sessions can make a
+   * full `structuredClone` larger than the remaining V8 heap headroom.
+   *
+   * Public history readers still use {@link getHistory}, which returns a
+   * defensive deep copy for caller mutation safety.
+   */
+  private getRequestHistory(): Content[] {
+    return extractCuratedHistory(this.history).map(copyContentContainer);
+  }
+
+  /**
    * Seed the last-prompt-token-count for chats created with inherited
    * history (forks, subagents, speculation). Without this, the auto-compress
    * threshold check sees `0` and refuses to compress — so the first API call
@@ -482,28 +533,13 @@ export class GeminiChat {
         info,
         compressedHistory: newHistory,
       });
-      // Auto-compaction replaces history in place — no env-context refresh
-      // here. Manual /compress goes through GeminiClient.tryCompressChat,
-      // which calls startChat() to re-prepend a fresh env snapshot. See
-      // GeminiClient.sendMessageStream for the rationale behind the split.
       this.setHistory(newHistory);
-      // Compaction summarises away prior full-Read tool results, but the
-      // FileReadCache still treats those reads as "in this conversation".
-      // A follow-up Read could then return the file_unchanged placeholder
-      // pointing at content the model can no longer retrieve from history.
       debugLogger.debug('[FILE_READ_CACHE] clear after auto tryCompress');
       this.config.getFileReadCache().clear();
       this.lastPromptTokenCount = info.newTokenCount;
-      // Mirror to the global singleton only when wired (main session).
-      // Subagents pass `telemetryService=undefined` to keep their context
-      // usage out of the main agent's UI counters.
       this.telemetryService?.setLastPromptTokenCount(info.newTokenCount);
-      // Re-enable auto-compaction so a forced /compress recovers a chat
-      // that an earlier auto-attempt latched off.
       this.hasFailedCompressionAttempt = false;
     } else if (isCompressionFailureStatus(info.compressionStatus)) {
-      // Track failed attempts (only mark as failed if not forced) so we
-      // stop spending compression-API calls on a chat that can't shrink.
       if (!force) {
         this.hasFailedCompressionAttempt = true;
       }
@@ -514,6 +550,36 @@ export class GeminiChat {
 
   setSystemInstruction(sysInstr: string) {
     this.generationConfig.systemInstruction = sysInstr;
+  }
+
+  setSessionStartContext(extraInstruction: string) {
+    const trimmed = extraInstruction.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    const current = this.generationConfig.systemInstruction;
+    let baseInstruction = '';
+    if (typeof current === 'string') {
+      baseInstruction = stripTrailingSessionStartContextBlock(current);
+    } else if (current) {
+      baseInstruction = getCustomSystemPrompt(current);
+      baseInstruction = stripTrailingSessionStartContextBlock(baseInstruction);
+    }
+    const contextBlock = buildSessionStartContextBlock(trimmed);
+    this.generationConfig.systemInstruction = `${baseInstruction}${contextBlock}`;
+  }
+
+  applySessionStartContext(
+    extraInstruction: string,
+    _source: SessionStartSource,
+  ): void {
+    const trimmed = extraInstruction.trim();
+    if (!trimmed) {
+      return;
+    }
+
+    this.setSessionStartContext(trimmed);
   }
 
   /**
@@ -571,7 +637,7 @@ export class GeminiChat {
       // Add user content to history ONCE before any attempts.
       this.history.push(userContent);
       userContentAdded = true;
-      requestContents = this.getHistory(true);
+      requestContents = this.getRequestHistory();
     } catch (error) {
       if (userContentAdded) {
         this.history.pop();
@@ -736,7 +802,7 @@ export class GeminiChat {
                     reactiveInfo.compressionStatus ===
                     CompressionStatus.COMPRESSED
                   ) {
-                    requestContents = self.getHistory(true);
+                    requestContents = self.getRequestHistory();
                     debugLogger.info(
                       `Reactive compression succeeded: ` +
                         `${reactiveInfo.originalTokenCount} -> ` +
@@ -940,7 +1006,7 @@ export class GeminiChat {
             // model's continuation appends to the previous partial output.
             yield { type: StreamEventType.RETRY, isContinuation: true };
             // Re-send with the updated history (includes partial + recovery)
-            const recoveryContents = self.getHistory(true);
+            const recoveryContents = self.getRequestHistory();
             escalatedFinishReason = undefined;
             try {
               const recoveryStream = await self.makeApiCallAndProcessStream(
@@ -1093,6 +1159,79 @@ export class GeminiChat {
     // Deep copy the history to avoid mutating the history outside of the
     // chat session.
     return structuredClone(history);
+  }
+
+  /**
+   * Returns a deep-copied tail of the chat history. This avoids cloning the
+   * entire session when callers only need recent context.
+   */
+  getHistoryTail(count: number, curated: boolean = false): Content[] {
+    if (count <= 0) return [];
+    const history = curated
+      ? extractCuratedHistory(this.history)
+      : this.history;
+    return structuredClone(history.slice(-count));
+  }
+
+  /**
+   * Returns a shallow copy of the history and each entry's parts array without
+   * cloning large part payloads. Use only for read-only consumers or consumers
+   * that replace touched entries before mutating them.
+   */
+  getHistoryShallow(curated: boolean = false): Content[] {
+    const history = curated
+      ? extractCuratedHistory(this.history)
+      : this.history;
+    return history.map(copyContentContainer);
+  }
+
+  /**
+   * Shallow tail variant for hot paths that only need recent history.
+   */
+  getHistoryTailShallow(count: number, curated: boolean = false): Content[] {
+    if (count <= 0) return [];
+    const history = curated
+      ? extractCuratedHistory(this.history)
+      : this.history;
+    return history.slice(-count).map(copyContentContainer);
+  }
+
+  /**
+   * Returns a defensive copy of the last raw history entry without cloning the
+   * full conversation. This avoids O(history) cloning, though cloning the last
+   * entry is still proportional to that entry's own size.
+   */
+  getLastHistoryEntry(): Content | undefined {
+    return this.getHistoryTail(1)[0];
+  }
+
+  /**
+   * Returns the last raw history entry for read-only checks. Callers must not
+   * mutate the returned object.
+   */
+  peekLastHistoryEntry(): Content | undefined {
+    return this.history.at(-1);
+  }
+
+  /**
+   * Returns concatenated text from the last model entry without cloning the
+   * full history. Used by stop hooks, where only the latest assistant text is
+   * needed.
+   */
+  getLastModelMessageText(): string | undefined {
+    for (let i = this.history.length - 1; i >= 0; i--) {
+      const message = this.history[i];
+      if (message?.role !== 'model') continue;
+      const text =
+        message.parts
+          ?.filter(
+            (part): part is { text: string } => typeof part.text === 'string',
+          )
+          .map((part) => part.text)
+          .join('') ?? '';
+      return text || undefined;
+    }
+    return undefined;
   }
 
   /**

@@ -25,6 +25,7 @@ import { setSimulate429 } from '../utils/testUtils.js';
 import { uiTelemetryService } from '../telemetry/uiTelemetry.js';
 import { CompressionStatus, type ChatCompressionInfo } from './turn.js';
 import { ChatCompressionService } from '../services/chatCompressionService.js';
+import { SessionStartSource } from '../hooks/types.js';
 
 // Mock fs module to prevent actual file system operations during tests
 const mockFileSystem = new Map<string, string>();
@@ -185,6 +186,110 @@ describe('GeminiChat', async () => {
     await vi.advanceTimersByTimeAsync(advanceByMs);
     return collecting;
   }
+
+  describe('system instruction helpers', () => {
+    it('replaces prior session-start context instead of appending indefinitely', () => {
+      const isolatedChat = new GeminiChat(
+        mockConfig,
+        {},
+        [],
+        undefined,
+        uiTelemetryService,
+      );
+      isolatedChat.setSystemInstruction('Base instruction');
+
+      isolatedChat.setSessionStartContext('Ctx1');
+      isolatedChat.setSessionStartContext('Ctx2');
+
+      expect(isolatedChat['generationConfig'].systemInstruction).toBe(
+        'Base instruction\n\n<qwen:session-start-context hidden="true">\nSessionStart additional context:\nCtx2\n</qwen:session-start-context>',
+      );
+    });
+
+    it('preserves existing system prompt suffixes when replacing session-start context', () => {
+      const isolatedChat = new GeminiChat(
+        mockConfig,
+        {},
+        [],
+        undefined,
+        uiTelemetryService,
+      );
+      isolatedChat.setSystemInstruction(
+        'Base instruction\n\n---\n\nUser memory\n\n---\n\nAppended rule',
+      );
+
+      isolatedChat.setSessionStartContext('Ctx1');
+      isolatedChat.setSessionStartContext('Ctx2');
+
+      expect(isolatedChat['generationConfig'].systemInstruction).toBe(
+        'Base instruction\n\n---\n\nUser memory\n\n---\n\nAppended rule\n\n<qwen:session-start-context hidden="true">\nSessionStart additional context:\nCtx2\n</qwen:session-start-context>',
+      );
+    });
+
+    it('preserves non-string systemInstruction content when applying session-start context', () => {
+      const isolatedChat = new GeminiChat(
+        mockConfig,
+        {
+          systemInstruction: {
+            role: 'system',
+            parts: [{ text: 'Base content instruction' }],
+          },
+        },
+        [],
+        undefined,
+        uiTelemetryService,
+      );
+
+      isolatedChat.setSessionStartContext('Ctx1');
+      isolatedChat.setSessionStartContext('Ctx2');
+
+      expect(isolatedChat['generationConfig'].systemInstruction).toBe(
+        'Base content instruction\n\n<qwen:session-start-context hidden="true">\nSessionStart additional context:\nCtx2\n</qwen:session-start-context>',
+      );
+    });
+
+    it('applies session-start context synchronously via applySessionStartContext', () => {
+      const isolatedChat = new GeminiChat(
+        mockConfig,
+        {},
+        [],
+        undefined,
+        uiTelemetryService,
+      );
+      isolatedChat.setSystemInstruction('Base instruction');
+
+      isolatedChat.applySessionStartContext(
+        '  Sync ctx  ',
+        SessionStartSource.Startup,
+      );
+
+      expect(isolatedChat['generationConfig'].systemInstruction).toBe(
+        'Base instruction\n\n<qwen:session-start-context hidden="true">\nSessionStart additional context:\nSync ctx\n</qwen:session-start-context>',
+      );
+    });
+
+    it('does not strip legitimate content that only resembles the old plain-text marker', () => {
+      const isolatedChat = new GeminiChat(
+        mockConfig,
+        {},
+        [],
+        undefined,
+        uiTelemetryService,
+      );
+      isolatedChat.setSystemInstruction(
+        'Base instruction\n\n---\n\nSessionStart additional context:\nLegitimate content',
+      );
+
+      isolatedChat.setSessionStartContext('Ctx1');
+
+      expect(isolatedChat['generationConfig'].systemInstruction).toContain(
+        'Legitimate content',
+      );
+      expect(isolatedChat['generationConfig'].systemInstruction).toContain(
+        '<qwen:session-start-context hidden="true">\nSessionStart additional context:\nCtx1\n</qwen:session-start-context>',
+      );
+    });
+  });
 
   describe('sendMessageStream', () => {
     it('should succeed if a tool call is followed by an empty part', async () => {
@@ -956,6 +1061,61 @@ describe('GeminiChat', async () => {
       );
     });
 
+    it('does not deep-clone the full curated history when building request contents', async () => {
+      chat.setHistory([
+        { role: 'user', parts: [{ text: 'prior question' }] },
+        { role: 'model', parts: [{ text: 'prior answer' }] },
+      ]);
+      const response = (async function* () {
+        yield {
+          candidates: [
+            {
+              content: {
+                parts: [{ text: 'response' }],
+                role: 'model',
+              },
+              finishReason: 'STOP',
+              index: 0,
+              safetyRatings: [],
+            },
+          ],
+          text: () => 'response',
+        } as unknown as GenerateContentResponse;
+      })();
+      vi.mocked(mockContentGenerator.generateContentStream).mockResolvedValue(
+        response,
+      );
+      const structuredCloneSpy = vi
+        .spyOn(globalThis, 'structuredClone')
+        .mockImplementation(() => {
+          throw new Error('structuredClone should not build request contents');
+        });
+
+      try {
+        const stream = await chat.sendMessageStream(
+          'test-model',
+          { message: 'hello' },
+          'prompt-id-no-request-clone',
+        );
+        for await (const _ of stream) {
+          // consume stream
+        }
+      } finally {
+        structuredCloneSpy.mockRestore();
+      }
+
+      expect(mockContentGenerator.generateContentStream).toHaveBeenCalledWith(
+        expect.objectContaining({
+          contents: [
+            { role: 'user', parts: [{ text: 'prior question' }] },
+            { role: 'model', parts: [{ text: 'prior answer' }] },
+            { role: 'user', parts: [{ text: 'hello' }] },
+          ],
+        }),
+        'prompt-id-no-request-clone',
+      );
+    });
+
     it('should not update global telemetry when no telemetryService is provided (subagent isolation)', async () => {
       // Simulate a subagent GeminiChat: created without a telemetryService
       const subagentChat = new GeminiChat(mockConfig, config, []);
@@ -1102,7 +1262,10 @@ describe('GeminiChat', async () => {
             compressionStatus: CompressionStatus.NOOP,
           },
         });
-      vi.spyOn(chat, 'getHistory').mockImplementationOnce(() => {
+      vi.spyOn(
+        chat as unknown as { getRequestHistory: () => Content[] },
+        'getRequestHistory',
+      ).mockImplementationOnce(() => {
         throw new Error('history setup failed');
       });
 
@@ -1779,6 +1942,146 @@ describe('GeminiChat', async () => {
       chat.addHistory({ role: 'model', parts: [{ text: 'b' }] });
       chat.addHistory({ role: 'user', parts: [{ text: 'c' }] });
       expect(chat.getHistoryLength()).toBe(chat.getHistory().length);
+    });
+  });
+
+  describe('getHistoryTail', () => {
+    it('returns only the requested recent entries as a deep copy', () => {
+      const oldContent: Content = { role: 'user', parts: [{ text: 'old' }] };
+      const recentContent: Content = {
+        role: 'model',
+        parts: [{ text: 'recent' }],
+      };
+      chat.addHistory(oldContent);
+      chat.addHistory(recentContent);
+
+      const tail = chat.getHistoryTail(1);
+
+      expect(tail).toEqual([recentContent]);
+      expect(tail[0]).not.toBe(recentContent);
+      tail[0]!.parts![0]!.text = 'mutated';
+      expect(chat.getHistory()[1]!.parts![0]!.text).toBe('recent');
+    });
+
+    it('returns an empty tail for non-positive counts', () => {
+      chat.addHistory({ role: 'user', parts: [{ text: 'a' }] });
+      expect(chat.getHistoryTail(0)).toEqual([]);
+      expect(chat.getHistoryTail(-1)).toEqual([]);
+    });
+  });
+
+  describe('getHistoryShallow', () => {
+    it('copies containers without structured-cloning large part payloads', () => {
+      const payload = { output: 'x'.repeat(128 * 1024) };
+      const content: Content = {
+        role: 'user',
+        parts: [
+          {
+            functionResponse: {
+              id: 'call-1',
+              name: 'read_file',
+              response: payload,
+            },
+          },
+        ],
+      };
+      chat.addHistory(content);
+      const structuredCloneSpy = vi
+        .spyOn(globalThis, 'structuredClone')
+        .mockImplementation(() => {
+          throw new Error('unexpected deep clone');
+        });
+
+      const history = chat.getHistoryShallow();
+
+      expect(structuredCloneSpy).not.toHaveBeenCalled();
+      expect(history).toEqual([content]);
+      expect(history[0]).not.toBe(content);
+      expect(history[0]!.parts).not.toBe(content.parts);
+      const response = history[0]!.parts![0] as {
+        functionResponse: { response: typeof payload };
+      };
+      expect(response.functionResponse.response).toBe(payload);
+    });
+  });
+
+  describe('getHistoryTailShallow', () => {
+    it('copies only recent containers without cloning payloads', () => {
+      const oldContent: Content = { role: 'user', parts: [{ text: 'old' }] };
+      const recentContent: Content = {
+        role: 'model',
+        parts: [{ text: 'recent' }],
+      };
+      chat.addHistory(oldContent);
+      chat.addHistory(recentContent);
+      const structuredCloneSpy = vi
+        .spyOn(globalThis, 'structuredClone')
+        .mockImplementation(() => {
+          throw new Error('unexpected deep clone');
+        });
+
+      const tail = chat.getHistoryTailShallow(1);
+
+      expect(structuredCloneSpy).not.toHaveBeenCalled();
+      expect(tail).toEqual([recentContent]);
+      expect(tail[0]).not.toBe(recentContent);
+      expect(tail[0]!.parts).not.toBe(recentContent.parts);
+    });
+  });
+
+  describe('getLastHistoryEntry', () => {
+    it('returns undefined for an empty history', () => {
+      expect(chat.getLastHistoryEntry()).toBeUndefined();
+    });
+
+    it('returns a defensive copy of only the last raw history entry', () => {
+      chat.addHistory({ role: 'user', parts: [{ text: 'a' }] });
+      chat.addHistory({ role: 'model', parts: [{ text: 'b' }] });
+
+      const last = chat.getLastHistoryEntry();
+      expect(last).toEqual({ role: 'model', parts: [{ text: 'b' }] });
+
+      last!.parts![0] = { text: 'mutated' };
+      expect(chat.getLastHistoryEntry()).toEqual({
+        role: 'model',
+        parts: [{ text: 'b' }],
+      });
+    });
+  });
+
+  describe('peekLastHistoryEntry', () => {
+    it('returns the last entry without structured-cloning the full history', () => {
+      const first: Content = { role: 'user', parts: [{ text: 'a' }] };
+      const last: Content = { role: 'model', parts: [{ text: 'b' }] };
+      chat.addHistory(first);
+      chat.addHistory(last);
+      const structuredCloneSpy = vi
+        .spyOn(globalThis, 'structuredClone')
+        .mockImplementation(() => {
+          throw new Error('unexpected deep clone');
+        });
+
+      expect(chat.peekLastHistoryEntry()).toBe(last);
+      expect(structuredCloneSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('getLastModelMessageText', () => {
+    it('returns text from the latest model message without cloning history', () => {
+      chat.addHistory({ role: 'model', parts: [{ text: 'older' }] });
+      chat.addHistory({ role: 'user', parts: [{ text: 'question' }] });
+      chat.addHistory({
+        role: 'model',
+        parts: [{ text: 'new' }, { text: ' answer' }],
+      });
+      const structuredCloneSpy = vi
+        .spyOn(globalThis, 'structuredClone')
+        .mockImplementation(() => {
+          throw new Error('unexpected deep clone');
+        });
+
+      expect(chat.getLastModelMessageText()).toBe('new answer');
+      expect(structuredCloneSpy).not.toHaveBeenCalled();
     });
   });
 
