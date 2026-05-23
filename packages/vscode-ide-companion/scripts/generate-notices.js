@@ -101,6 +101,11 @@ function collectDependencies(packageName, packageLock, dependenciesMap) {
     return;
   }
 
+  // Skip workspace-linked packages — they are first-party code, not third-party notices
+  if (packageInfo.link) {
+    return;
+  }
+
   dependenciesMap.set(packageName, packageInfo.version);
 
   if (packageInfo.dependencies) {
