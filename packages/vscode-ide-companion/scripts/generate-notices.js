@@ -88,12 +88,29 @@ async function getDependencyLicense(depName, depVersion) {
   };
 }
 
+function resolvePackageInfo(packageName, packageLock) {
+  const suffix = `node_modules/${packageName}`;
+  // Check hoisted (top-level) first, then any nested location under this workspace
+  if (packageLock.packages[suffix]) {
+    return packageLock.packages[suffix];
+  }
+  for (const key of Object.keys(packageLock.packages)) {
+    if (
+      key.endsWith(suffix) &&
+      key.startsWith('packages/vscode-ide-companion/')
+    ) {
+      return packageLock.packages[key];
+    }
+  }
+  return null;
+}
+
 function collectDependencies(packageName, packageLock, dependenciesMap) {
   if (dependenciesMap.has(packageName)) {
     return;
   }
 
-  const packageInfo = packageLock.packages[`node_modules/${packageName}`];
+  const packageInfo = resolvePackageInfo(packageName, packageLock);
   if (!packageInfo) {
     console.warn(
       `Warning: Could not find package info for ${packageName} in package-lock.json.`,
