@@ -84,9 +84,7 @@ import { start_sandbox } from './utils/sandbox.js';
 import { getStartupWarnings } from './utils/startupWarnings.js';
 import { getUserStartupWarnings } from './utils/userStartupWarnings.js';
 import { getCliVersion } from './utils/version.js';
-import { initializeWarningHandler } from './utils/warningHandler.js';
 import { writeStderrLine } from './utils/stdioHelpers.js';
-import { getHeadlessYoloSafetyWarning } from './utils/headlessSafetyWarnings.js';
 import { computeWindowTitle } from './utils/windowTitle.js';
 import {
   startEarlyInputCapture,
@@ -330,13 +328,13 @@ export async function startInteractiveUI(
                 <VimModeProvider settings={settings}>
                   <AgentViewProvider config={config}>
                     <BackgroundTaskViewProvider config={config}>
-                        <AppContainer
-                          config={config}
-                          settings={settings}
-                          startupWarnings={startupWarnings}
-                          version={version}
-                          initializationResult={initializationResult}
-                        />
+                      <AppContainer
+                        config={config}
+                        settings={settings}
+                        startupWarnings={startupWarnings}
+                        version={version}
+                        initializationResult={initializationResult}
+                      />
                     </BackgroundTaskViewProvider>
                   </AgentViewProvider>
                 </VimModeProvider>
@@ -410,7 +408,6 @@ export async function main() {
     setStartupEventSink((name, attrs) => recordStartupEvent(name, attrs));
   }
   setupUnhandledRejectionHandler();
-  initializeWarningHandler();
 
   if (process.argv.includes('--bare')) {
     process.env[QWEN_CODE_SIMPLE_ENV_VAR] = '1';
@@ -592,6 +589,14 @@ export async function main() {
       );
       process.exit(0);
     } else {
+      // Emit settings migration warnings before relaunch — the parent process
+      // exits inside relaunchAppInChildProcess and never reaches the main
+      // warning loop. The child starts with a clean settings file, so these
+      // warnings would be lost without emitting them here.
+      for (const warning of settings.migrationWarnings) {
+        writeStderrLine(`Warning: ${warning}`);
+      }
+
       // Relaunch app so we always have a child process that can be internally
       // restarted if needed.
       await relaunchAppInChildProcess(memoryArgs, []);
@@ -814,15 +819,6 @@ export async function main() {
       );
     }
 
-    // FIXME: list extensions after the config initialize
-    // if (config.getListExtensions()) {
-    //   console.log('Installed extensions:');
-    //   for (const extension of extensions) {
-    //     console.log(`- ${extension.config.name}`);
-    //   }
-    //   process.exit(0);
-    // }
-
     const wasRaw = process.stdin.isRaw;
     let kittyProtocolDetectionComplete: Promise<boolean> | undefined;
     let themeAutoDetectionComplete: Promise<void> | undefined;
@@ -875,6 +871,25 @@ export async function main() {
     // For other modes, initialize normally
     const initializationResult = await initializeApp(config, settings);
     profileCheckpoint('after_initialize_app');
+
+    if (config.getListExtensions()) {
+      const extensions = config.getExtensions();
+      if (extensions.length === 0) {
+        // eslint-disable-next-line no-console -- CLI flag output
+        console.log('No extensions installed.');
+      } else {
+        // eslint-disable-next-line no-console -- CLI flag output
+        console.log('Installed extensions:');
+        for (const extension of extensions) {
+          // eslint-disable-next-line no-console -- CLI flag output
+          console.log(
+            `- ${extension.name} (v${extension.version})${extension.isActive ? '' : ' [disabled]'}`,
+          );
+        }
+      }
+      await runExitCleanup();
+      process.exit(0);
+    }
 
     if (config.getExperimentalZedIntegration()) {
       await runAcpAgent(config, settings, argv);
@@ -973,17 +988,6 @@ export async function main() {
           'Warning: Debug logging is degraded (write failures occurred)',
         );
       }
-    }
-
-    // Headless + YOLO without a sandbox lets the model auto-approve and
-    // execute shell / write / edit tools at the current process's
-    // privilege level. Emit a one-line stderr warning so unattended runs
-    // have at least an observable signal. Interactive runs are excluded
-    // because the user is at the keyboard and the TUI shows approval
-    // state directly. See issue #4103.
-    if (!config.isInteractive()) {
-      const yoloWarning = getHeadlessYoloSafetyWarning(config);
-      if (yoloWarning) writeStderrLine(yoloWarning);
     }
 
     // For non-stream-json mode, initialize config here. Stream-json defers
