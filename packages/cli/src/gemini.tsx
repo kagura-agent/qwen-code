@@ -593,10 +593,9 @@ export async function main() {
       process.exit(0);
     } else {
       // Emit settings migration warnings before relaunch — the parent process
-      // exits inside relaunchAppInChildProcess and never reaches the main
-      // warning loop. The child process re-parses settings from scratch and
-      // won't re-trigger the same migrations, so these warnings would be
-      // lost without emitting them here.
+      // exits inside relaunchAppInChildProcess and never reaches the
+      // startupWarnings display path further down in main(). Without this
+      // early emit, migration warnings would be silently lost.
       for (const warning of settings.migrationWarnings) {
         writeStderrLine(`Warning: ${warning}`);
       }
@@ -1006,9 +1005,16 @@ export async function main() {
           // eslint-disable-next-line no-console -- CLI flag output
           console.log('Installed extensions:');
           for (const extension of extensions) {
+            // Strip non-printable characters from version to prevent
+            // terminal escape sequence injection.
+            const safeVersion = extension.version.replace(
+              // eslint-disable-next-line no-control-regex -- intentional: strip control chars for safety
+              /[\x00-\x1f\x7f-\x9f]/g,
+              '',
+            );
             // eslint-disable-next-line no-console -- CLI flag output
             console.log(
-              `- ${extension.name} (v${extension.version})${extension.isActive ? '' : ' [disabled]'}`,
+              `- ${extension.name} (v${safeVersion})${extension.isActive ? '' : ' [disabled]'}`,
             );
           }
         }
