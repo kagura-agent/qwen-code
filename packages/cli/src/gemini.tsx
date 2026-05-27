@@ -84,7 +84,9 @@ import { start_sandbox } from './utils/sandbox.js';
 import { getStartupWarnings } from './utils/startupWarnings.js';
 import { getUserStartupWarnings } from './utils/userStartupWarnings.js';
 import { getCliVersion } from './utils/version.js';
+import { initializeWarningHandler } from './utils/warningHandler.js';
 import { writeStderrLine } from './utils/stdioHelpers.js';
+import { getHeadlessYoloSafetyWarning } from './utils/headlessSafetyWarnings.js';
 import { computeWindowTitle } from './utils/windowTitle.js';
 import {
   startEarlyInputCapture,
@@ -408,6 +410,7 @@ export async function main() {
     setStartupEventSink((name, attrs) => recordStartupEvent(name, attrs));
   }
   setupUnhandledRejectionHandler();
+  initializeWarningHandler();
 
   if (process.argv.includes('--bare')) {
     process.env[QWEN_CODE_SIMPLE_ENV_VAR] = '1';
@@ -591,8 +594,9 @@ export async function main() {
     } else {
       // Emit settings migration warnings before relaunch — the parent process
       // exits inside relaunchAppInChildProcess and never reaches the main
-      // warning loop. The child starts with a clean settings file, so these
-      // warnings would be lost without emitting them here.
+      // warning loop. The child process re-parses settings from scratch and
+      // won't re-trigger the same migrations, so these warnings would be
+      // lost without emitting them here.
       for (const warning of settings.migrationWarnings) {
         writeStderrLine(`Warning: ${warning}`);
       }
@@ -811,7 +815,9 @@ export async function main() {
       const authType = modelsConfig.getCurrentAuthType();
       const resolvedBaseUrl = modelsConfig.getGenerationConfig().baseUrl;
       const proxy = config.getProxy();
-      preconnectApi(authType, { resolvedBaseUrl, proxy });
+      if (!config.getListExtensions()) {
+        preconnectApi(authType, { resolvedBaseUrl, proxy });
+      }
     } catch (error) {
       // If we can't get authType, skip preconnect - it's optional optimization
       debugLogger.debug(
@@ -871,25 +877,6 @@ export async function main() {
     // For other modes, initialize normally
     const initializationResult = await initializeApp(config, settings);
     profileCheckpoint('after_initialize_app');
-
-    if (config.getListExtensions()) {
-      const extensions = config.getExtensions();
-      if (extensions.length === 0) {
-        // eslint-disable-next-line no-console -- CLI flag output
-        console.log('No extensions installed.');
-      } else {
-        // eslint-disable-next-line no-console -- CLI flag output
-        console.log('Installed extensions:');
-        for (const extension of extensions) {
-          // eslint-disable-next-line no-console -- CLI flag output
-          console.log(
-            `- ${extension.name} (v${extension.version})${extension.isActive ? '' : ' [disabled]'}`,
-          );
-        }
-      }
-      await runExitCleanup();
-      process.exit(0);
-    }
 
     if (config.getExperimentalZedIntegration()) {
       await runAcpAgent(config, settings, argv);
@@ -990,6 +977,17 @@ export async function main() {
       }
     }
 
+    // Headless + YOLO without a sandbox lets the model auto-approve and
+    // execute shell / write / edit tools at the current process's
+    // privilege level. Emit a one-line stderr warning so unattended runs
+    // have at least an observable signal. Interactive runs are excluded
+    // because the user is at the keyboard and the TUI shows approval
+    // state directly. See issue #4103.
+    if (!config.isInteractive()) {
+      const yoloWarning = getHeadlessYoloSafetyWarning(config);
+      if (yoloWarning) writeStderrLine(yoloWarning);
+    }
+
     // For non-stream-json mode, initialize config here. Stream-json defers
     // `config.initialize()` to inside `Session.ensureConfigInitialized`
     // because the initial control_request may register SDK MCP servers
@@ -998,6 +996,26 @@ export async function main() {
       profileCheckpoint('config_initialize_start');
       await config.initialize();
       profileCheckpoint('config_initialize_end');
+
+      if (config.getListExtensions()) {
+        const extensions = config.getExtensions();
+        if (extensions.length === 0) {
+          // eslint-disable-next-line no-console -- CLI flag output
+          console.log('No extensions installed.');
+        } else {
+          // eslint-disable-next-line no-console -- CLI flag output
+          console.log('Installed extensions:');
+          for (const extension of extensions) {
+            // eslint-disable-next-line no-console -- CLI flag output
+            console.log(
+              `- ${extension.name} (v${extension.version})${extension.isActive ? '' : ' [disabled]'}`,
+            );
+          }
+        }
+        await runExitCleanup();
+        process.exit(0);
+      }
+
       // Non-interactive paths feed a prompt to the model immediately after
       // init. Under PR-A's progressive MCP availability,
       // `config.initialize()` returns BEFORE MCP servers settle, so

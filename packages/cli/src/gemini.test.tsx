@@ -24,7 +24,7 @@ import type { CliArgs } from './config/config.js';
 import { type LoadedSettings } from './config/settings.js';
 import { appEvents, AppEvent } from './utils/events.js';
 import type { Config } from '@qwen-code/qwen-code-core';
-import { OutputFormat } from '@qwen-code/qwen-code-core';
+import { ApprovalMode, OutputFormat } from '@qwen-code/qwen-code-core';
 
 const mockWriteStderrLine = vi.hoisted(() => vi.fn());
 
@@ -181,6 +181,7 @@ describe('gemini.tsx main function', () => {
         isInteractive: () => false,
         getQuestion: () => '',
         getSandbox: () => false,
+        getApprovalMode: () => ApprovalMode.DEFAULT,
         getDebugMode: () => false,
         getListExtensions: () => false,
         getMcpServers: () => ({}),
@@ -260,6 +261,7 @@ describe('gemini.tsx main function', () => {
       isInteractive: () => false,
       getQuestion: () => 'bare prompt',
       getSandbox: () => false,
+      getApprovalMode: () => ApprovalMode.DEFAULT,
       getDebugMode: () => false,
       getListExtensions: () => false,
       getMcpServers: () => ({}),
@@ -569,6 +571,7 @@ describe('gemini.tsx main function', () => {
       isInteractive: () => false,
       getQuestion: () => '  hello stream  ',
       getSandbox: () => false,
+      getApprovalMode: () => ApprovalMode.DEFAULT,
       getDebugMode: () => false,
       getListExtensions: () => false,
       getMcpServers: () => ({}),
@@ -674,6 +677,7 @@ describe('gemini.tsx main function', () => {
       getDebugMode: () => false,
       getListExtensions: () => true,
       getExtensions: () => [],
+      getApprovalMode: () => 'suggest',
       getMcpServers: () => ({}),
       initialize: vi.fn().mockResolvedValue(undefined),
       waitForMcpReady: vi.fn().mockResolvedValue(undefined),
@@ -699,6 +703,10 @@ describe('gemini.tsx main function', () => {
     expect(consoleLogSpy).toHaveBeenCalledWith('No extensions installed.');
     expect(processExitSpy).toHaveBeenCalledWith(0);
     expect(runExitCleanupMock).toHaveBeenCalledTimes(1);
+    // Verify config.initialize() is called before getExtensions() — extensions are loaded during initialize
+    const configMock = (await vi.mocked(loadCliConfig).mock.results[0]!
+      .value) as unknown as { initialize: ReturnType<typeof vi.fn> };
+    expect(configMock.initialize).toHaveBeenCalledTimes(1);
 
     consoleLogSpy.mockRestore();
     processExitSpy.mockRestore();
@@ -749,6 +757,7 @@ describe('gemini.tsx main function', () => {
         { name: 'my-ext', version: '1.0.0', isActive: true },
         { name: 'old-ext', version: '0.5.2', isActive: false },
       ],
+      getApprovalMode: () => 'suggest',
       getMcpServers: () => ({}),
       initialize: vi.fn().mockResolvedValue(undefined),
       waitForMcpReady: vi.fn().mockResolvedValue(undefined),
@@ -776,6 +785,10 @@ describe('gemini.tsx main function', () => {
     expect(consoleLogSpy).toHaveBeenCalledWith('- old-ext (v0.5.2) [disabled]');
     expect(processExitSpy).toHaveBeenCalledWith(0);
     expect(runExitCleanupMock).toHaveBeenCalledTimes(1);
+    // Verify config.initialize() is called before getExtensions() — extensions are loaded during initialize
+    const configMock2 = (await vi.mocked(loadCliConfig).mock.results[0]!
+      .value) as unknown as { initialize: ReturnType<typeof vi.fn> };
+    expect(configMock2.initialize).toHaveBeenCalledTimes(1);
 
     consoleLogSpy.mockRestore();
     processExitSpy.mockRestore();
@@ -922,6 +935,8 @@ describe('gemini.tsx main function kitty protocol', () => {
       disabledSlashCommands: undefined,
       authType: undefined,
       maxSessionTurns: undefined,
+      maxWallTime: undefined,
+      maxToolCalls: undefined,
       experimentalLsp: undefined,
       channel: undefined,
       chatRecording: undefined,
