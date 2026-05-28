@@ -592,14 +592,6 @@ export async function main() {
       );
       process.exit(0);
     } else {
-      // Emit settings migration warnings before relaunch — the parent process
-      // exits inside relaunchAppInChildProcess and never reaches the
-      // startupWarnings display path further down in main(). Without this
-      // early emit, migration warnings would be silently lost.
-      for (const warning of settings.migrationWarnings) {
-        writeStderrLine(`Warning: ${warning}`);
-      }
-
       // Relaunch app so we always have a child process that can be internally
       // restarted if needed.
       await relaunchAppInChildProcess(memoryArgs, []);
